@@ -1,0 +1,822 @@
+# =============================================================================
+# TEMPO CONFIGURATION
+# File: /etc/tempo/tempo.yml
+# =============================================================================
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+  log_level: info
+
+distributor:
+  receivers:
+    # OTLP gRPC receiver (recommended)
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+    
+    # Jaeger receivers (for compatibility)
+    jaeger:
+      protocols:
+        thrift_http:
+          endpoint: 0.0.0.0:14268
+        grpc:
+          endpoint: 0.0.0.0:14250
+    
+    # Zipkin receiver (for compatibility)
+    zipkin:
+      endpoint: 0.0.0.0:9411
+
+  ring:
+    kvstore:
+      store: memberlist
+
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: memberlist
+      replication_factor: 2  # 2 instances for HA
+    
+    # Trace flush settings
+    trace_idle_period: 30s
+    max_block_bytes: 1048576  # 1MB
+    max_block_duration: 30m
+  
+  # How long to keep traces in memory before flushing
+  max_traces_per_user: 50000
+
+memberlist:
+  node_name: tempo-1  # Change to tempo-2 for second instance
+  bind_port: 7946
+  join_members:
+    - tempo-1.internal:7946
+    - tempo-2.internal:7946
+
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: prod-observability-tempo-traces
+      region: us-east-1
+      # Use IAM role for credentials
+    
+    # Local cache for recent traces
+    wal:
+      path: /var/lib/tempo/wal
+    
+    # Block configuration
+    block:
+      version: vParquet3  # Parquet format (most efficient)
+      rowGroupSizeBytes: 134217728  # 128MB
+    
+    # Local disk buffer
+    local:
+      path: /var/lib/tempo/blocks
+    
+    # Block retention
+    pool:
+      max_workers: 100
+      queue_depth: 10000
+
+compactor:
+  compaction:
+    block_retention: 720h  # 30 days
+    compacted_block_retention: 1h
+    compaction_window: 1h
+    max_block_bytes: 107374182400  # 100GB
+    max_compaction_objects: 6000000
+  
+  ring:
+    kvstore:
+      store: memberlist
+
+querier:
+  frontend_worker:
+    frontend_address: localhost:9095  # Query frontend address
+  
+  # Trace by ID cache
+  max_concurrent_queries: 20
+  
+  # Search configuration
+  search:
+    external_hedge_requests_at: 8s
+    external_hedge_requests_up_to: 2
+
+query_frontend:
+  search:
+    max_duration: 168h  # 7 days (searching beyond this is slow)
+    default_result_limit: 20
+    max_result_limit: 1000
+  
+  # Query splitting for large time ranges
+  max_outstanding_per_tenant: 2000
+  max_retries: 2
+
+metrics_generator:
+  ring:
+    kvstore:
+      store: memberlist
+  
+  # Generate metrics from traces
+  processor:
+    # Service graph processor (service dependencies)
+    service_graphs:
+      enabled: true
+      max_items: 10000
+      wait: 10s
+      workers: 10
+    
+    # Span metrics processor (RED metrics)
+    span_metrics:
+      enabled: true
+      dimensions:
+        - service
+        - span_name
+        - span_kind
+        - status_code
+      
+      # Generate exemplars (link metrics to traces)
+      enable_target_info: true
+  
+  storage:
+    path: /var/lib/tempo/generator/wal
+    remote_write:
+      # Send generated metrics to Prometheus
+      - url: http://prometheus-1.internal:9090/api/v1/write
+        send_exemplars: true
+      - url: http://prometheus-2.internal:9090/api/v1/write
+        send_exemplars: true
+
+overrides:
+  defaults:
+    # Ingestion limits
+    max_traces_per_user: 100000
+    max_bytes_per_trace: 5000000  # 5MB
+    
+    # Search limits
+    max_search_bytes_per_trace: 50000
+    
+    # Metrics generation
+    metrics_generator_processors:
+      - service-graphs
+      - span-metrics
+
+# =============================================================================
+# OPENTELEMETRY COLLECTOR CONFIGURATION (Agent Mode)
+# File: /etc/otel-collector/config.yml
+# Deployed on all 50 monitored hosts
+# =============================================================================
+
+receivers:
+  # Receive OTLP from applications
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  
+  # Prometheus receiver (scrape local exporters)
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: 'node-exporter'
+          scrape_interval: 30s
+          static_configs:
+            - targets: ['localhost:9100']
+              labels:
+                host: '${env:HOSTNAME}'
+  
+  # Host metrics receiver (system metrics)
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      disk:
+      filesystem:
+      network:
+      load:
+      processes:
+      paging:
+
+processors:
+  # Batch processor (improve efficiency)
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+  
+  # Memory limiter (prevent OOM)
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  
+  # Resource processor (add host metadata)
+  resource:
+    attributes:
+      - key: host.name
+        value: ${env:HOSTNAME}
+        action: insert
+      - key: host.id
+        value: ${env:EC2_INSTANCE_ID}
+        action: insert
+      - key: cloud.provider
+        value: aws
+        action: insert
+      - key: cloud.region
+        value: us-east-1
+        action: insert
+      - key: deployment.environment
+        value: production
+        action: insert
+  
+  # Attributes processor (enrich traces/metrics)
+  attributes:
+    actions:
+      # Add trace context to logs
+      - key: trace_id
+        from_context: trace_id
+        action: insert
+      - key: span_id
+        from_context: span_id
+        action: insert
+  
+  # Resource detection (auto-detect cloud metadata)
+  resourcedetection:
+    detectors: [env, ec2, system]
+    timeout: 5s
+    override: false
+  
+  # Filter processor (drop unwanted data)
+  filter:
+    metrics:
+      exclude:
+        match_type: regexp
+        metric_names:
+          - 'go_.*'  # Drop Go runtime metrics
+          - '.*bucket'  # Drop histogram buckets (keep summaries)
+  
+  # Transform processor (modify data)
+  transform:
+    metric_statements:
+      - context: metric
+        statements:
+          # Normalize metric names
+          - set(name, "system.cpu.utilization") where name == "cpu_usage_percent"
+
+exporters:
+  # Prometheus remote write (metrics)
+  prometheusremotewrite:
+    endpoint: http://prometheus-1.internal:9090/api/v1/write
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  
+  # Loki exporter (logs)
+  loki:
+    endpoint: http://loki-1.internal:3100/loki/api/v1/push
+    labels:
+      resource:
+        host.name: "host_name"
+        service.name: "service_name"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  
+  # OTLP exporter (traces to Tempo)
+  otlp:
+    endpoint: tempo-1.internal:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  
+  # Logging exporter (for debugging)
+  logging:
+    loglevel: info
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  # Health check endpoint
+  health_check:
+    endpoint: 0.0.0.0:13133
+  
+  # pprof for profiling
+  pprof:
+    endpoint: localhost:1777
+  
+  # zpages for debugging
+  zpages:
+    endpoint: localhost:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  
+  pipelines:
+    # Metrics pipeline
+    metrics:
+      receivers: [otlp, prometheus, hostmetrics]
+      processors: [memory_limiter, resourcedetection, resource, batch]
+      exporters: [prometheusremotewrite]
+    
+    # Logs pipeline
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource, attributes, batch]
+      exporters: [loki]
+    
+    # Traces pipeline
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource, batch]
+      exporters: [otlp]
+  
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: localhost:8888
+
+# =============================================================================
+# GRAFANA CONFIGURATION
+# File: /etc/grafana/grafana.ini
+# =============================================================================
+
+[server]
+protocol = http
+http_port = 3000
+domain = grafana.example.com
+root_url = https://%(domain)s/
+enable_gzip = true
+cert_file =
+cert_key =
+
+[database]
+type = postgres
+host = grafana-db.xxxxx.us-east-1.rds.amazonaws.com:5432
+name = grafana
+user = grafana
+password = ${GF_DATABASE_PASSWORD}  # Set via environment variable
+ssl_mode = require
+max_open_conn = 100
+max_idle_conn = 100
+conn_max_lifetime = 14400
+
+[security]
+admin_user = admin
+admin_password = ${GF_SECURITY_ADMIN_PASSWORD}
+secret_key = ${GF_SECURITY_SECRET_KEY}
+disable_gravatar = false
+cookie_secure = true
+cookie_samesite = lax
+allow_embedding = false
+strict_transport_security = true
+strict_transport_security_max_age_seconds = 86400
+content_security_policy = true
+
+[users]
+allow_sign_up = false
+allow_org_create = false
+auto_assign_org = true
+auto_assign_org_role = Viewer
+default_theme = dark
+
+[auth]
+disable_login_form = false
+oauth_auto_login = false
+disable_signout_menu = false
+
+# SSO via OAuth (example: Google)
+[auth.google]
+enabled = false
+client_id = YOUR_CLIENT_ID
+client_secret = YOUR_CLIENT_SECRET
+scopes = openid email profile
+auth_url = https://accounts.google.com/o/oauth2/auth
+token_url = https://oauth2.googleapis.com/token
+allowed_domains = example.com
+allow_sign_up = true
+
+[auth.anonymous]
+enabled = false
+
+[session]
+provider = postgres  # Store sessions in database (for multi-instance HA)
+provider_config = 
+cookie_name = grafana_session
+cookie_secure = true
+session_life_time = 86400
+gc_interval_time = 86400
+
+[dataproxy]
+timeout = 300
+keep_alive_seconds = 30
+idle_connections_per_host = 100
+
+[analytics]
+reporting_enabled = false
+check_for_updates = true
+
+[log]
+mode = console
+level = info
+filters = 
+
+[log.console]
+format = json
+
+[metrics]
+enabled = true
+interval_seconds = 10
+basic_auth_username = 
+basic_auth_password = 
+
+[metrics.graphite]
+address =
+prefix = prod.grafana.%(instance_name)s.
+
+[tracing.opentelemetry.otlp]
+# Send Grafana's own traces to Tempo
+address = tempo-1.internal:4317
+propagation = w3c
+
+[alerting]
+enabled = true
+execute_alerts = true
+max_attempts = 3
+min_interval_seconds = 10
+
+[unified_alerting]
+enabled = true
+execute_alerts = true
+max_attempts = 3
+min_interval_seconds = 10
+
+[unified_alerting.screenshots]
+capture = true
+
+[explore]
+enabled = true
+
+[feature_toggles]
+enable = tempoSearch tempoBackendSearch traceToMetrics correlations
+
+[plugins]
+enable_alpha = false
+app_tls_skip_verify_insecure = false
+
+# =============================================================================
+# GRAFANA DATA SOURCE PROVISIONING
+# File: /etc/grafana/provisioning/datasources/datasources.yml
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  # Prometheus (via Thanos Query)
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://thanos-query-1.internal:10902
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 30s
+      queryTimeout: 300s
+      exemplarTraceIdDestinations:
+        # Link exemplars to Tempo traces
+        - name: trace_id
+          datasourceUid: tempo
+      # Enable Prometheus features
+      prometheusType: Thanos
+      prometheusVersion: 2.40.0
+      cacheLevel: 'High'
+    version: 1
+  
+  # Loki
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki-1.internal:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        # Link logs to traces via trace_id
+        - datasourceUid: tempo
+          matcherRegex: '"trace_id":\s*"(\w+)"'
+          name: TraceID
+          url: '$${__value.raw}'
+    version: 1
+  
+  # Tempo
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo-1.internal:3200
+    editable: false
+    uid: tempo
+    jsonData:
+      httpMethod: GET
+      tracesToLogs:
+        # Link traces to logs
+        datasourceUid: loki
+        tags: ['host', 'service']
+        mappedTags:
+          - key: service.name
+            value: service
+        mapTagNamesEnabled: true
+        spanStartTimeShift: '-1m'
+        spanEndTimeShift: '1m'
+        filterByTraceID: true
+        filterBySpanID: false
+        lokiSearch: true
+      tracesToMetrics:
+        # Link traces to metrics
+        datasourceUid: prometheus
+        tags:
+          - key: service.name
+            value: service
+        queries:
+          - name: 'Request Rate'
+            query: 'sum(rate(http_server_requests_total{service="$service"}[5m]))'
+          - name: 'Error Rate'
+            query: 'sum(rate(http_server_requests_total{service="$service",status=~"5.."}[5m])) / sum(rate(http_server_requests_total{service="$service"}[5m]))'
+          - name: 'P95 Latency'
+            query: 'histogram_quantile(0.95, sum(rate(http_server_request_duration_seconds_bucket{service="$service"}[5m])) by (le))'
+      serviceMap:
+        datasourceUid: prometheus
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true
+      lokiSearch:
+        datasourceUid: loki
+    version: 1
+  
+  # Grafana Faro (RUM)
+  - name: Faro
+    type: grafana-pyroscope-datasource  # Faro uses Pyroscope data source
+    access: proxy
+    url: http://faro-collector.internal:12347
+    editable: false
+    jsonData:
+      keepCookies: []
+    version: 1
+
+# =============================================================================
+# GRAFANA DASHBOARD PROVISIONING
+# File: /etc/grafana/provisioning/dashboards/dashboards.yml
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: 'Infrastructure Dashboards'
+    orgId: 1
+    folder: 'Infrastructure'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/infrastructure
+  
+  - name: 'Application Dashboards'
+    orgId: 1
+    folder: 'Applications'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/applications
+  
+  - name: 'Observability Platform'
+    orgId: 1
+    folder: 'Monitoring'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 60
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/monitoring
+
+# =============================================================================
+# SYSTEMD SERVICE FILES
+# =============================================================================
+
+# File: /etc/systemd/system/tempo.service
+[Unit]
+Description=Tempo
+Documentation=https://grafana.com/docs/tempo/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=tempo
+Group=tempo
+ExecStart=/usr/local/bin/tempo \
+  -config.file=/etc/tempo/tempo.yml
+
+Restart=always
+RestartSec=5
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
+# File: /etc/systemd/system/otel-collector.service
+[Unit]
+Description=OpenTelemetry Collector
+Documentation=https://opentelemetry.io/docs/collector/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=otel
+Group=otel
+ExecStart=/usr/local/bin/otelcol-contrib \
+  --config=/etc/otel-collector/config.yml
+
+Restart=always
+RestartSec=5
+
+Environment="HOSTNAME=%H"
+Environment="EC2_INSTANCE_ID=%i"
+
+[Install]
+WantedBy=multi-user.target
+
+# File: /etc/systemd/system/grafana-server.service
+[Unit]
+Description=Grafana
+Documentation=https://grafana.com/docs/
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=grafana
+Group=grafana
+ExecStart=/usr/local/bin/grafana-server \
+  --config=/etc/grafana/grafana.ini \
+  --homepath=/usr/share/grafana \
+  cfg:default.paths.logs=/var/log/grafana \
+  cfg:default.paths.data=/var/lib/grafana \
+  cfg:default.paths.plugins=/var/lib/grafana/plugins \
+  cfg:default.paths.provisioning=/etc/grafana/provisioning
+
+Restart=always
+RestartSec=5
+
+Environment="GF_DATABASE_PASSWORD=YOUR_DB_PASSWORD"
+Environment="GF_SECURITY_ADMIN_PASSWORD=YOUR_ADMIN_PASSWORD"
+Environment="GF_SECURITY_SECRET_KEY=YOUR_SECRET_KEY"
+
+[Install]
+WantedBy=multi-user.target
+
+# =============================================================================
+# EXAMPLE APPLICATION INSTRUMENTATION (Python with OpenTelemetry)
+# =============================================================================
+
+# requirements.txt
+"""
+opentelemetry-api==1.22.0
+opentelemetry-sdk==1.22.0
+opentelemetry-instrumentation-flask==0.43b0
+opentelemetry-instrumentation-requests==0.43b0
+opentelemetry-exporter-otlp-proto-grpc==1.22.0
+"""
+
+# app.py
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from flask import Flask
+import logging
+
+# Configure resource attributes
+resource = Resource.create({
+    "service.name": "my-python-service",
+    "service.version": "1.0.0",
+    "deployment.environment": "production",
+})
+
+# Set up tracing
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+
+# OTLP exporter to local OTel Collector
+otlp_trace_exporter = OTLPSpanExporter(
+    endpoint="http://localhost:4317",
+    insecure=True,
+)
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(otlp_trace_exporter)
+)
+
+# Set up metrics
+otlp_metric_exporter = OTLPMetricExporter(
+    endpoint="http://localhost:4317",
+    insecure=True,
+)
+metric_reader = PeriodicExportingMetricReader(otlp_metric_exporter)
+metrics.set_meter_provider(MeterProvider(
+    resource=resource,
+    metric_readers=[metric_reader]
+))
+meter = metrics.get_meter(__name__)
+
+# Create Flask app
+app = Flask(__name__)
+
+# Auto-instrument Flask
+FlaskInstrumentor().instrument_app(app)
+
+# Configure logging with trace context
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp":"%(asctime)s","level":"%(levelname)s","message":"%(message)s","trace_id":"%(otelTraceID)s","span_id":"%(otelSpanID)s"}',
+)
+
+@app.route("/")
+def hello():
+    # Manual span creation
+    with tracer.start_as_current_span("hello_handler"):
+        current_span = trace.get_current_span()
+        current_span.set_attribute("user.id", "12345")
+        
+        # Add trace context to logs
+        trace_id = format(current_span.get_span_context().trace_id, '032x')
+        span_id = format(current_span.get_span_context().span_id, '016x')
+        
+        logging.info("Hello endpoint called", extra={
+            'otelTraceID': trace_id,
+            'otelSpanID': span_id,
+        })
+        
+        return "Hello, World!"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
+# =============================================================================
+# INSTALLATION SCRIPT (Example for Amazon Linux 2023)
+# File: install-all.sh
+# =============================================================================
+
+#!/bin/bash
+set -e
+
+echo "Installing Observability Platform Components..."
+
+# Install Tempo
+TEMPO_VERSION="2.3.1"
+curl -L -o tempo.tar.gz \
+  "https://github.com/grafana/tempo/releases/download/v${TEMPO_VERSION}/tempo_${TEMPO_VERSION}_linux_amd64.tar.gz"
+tar -xzf tempo.tar.gz
+sudo mv tempo /usr/local/bin/
+sudo chmod +x /usr/local/bin/tempo
+
+# Install OpenTelemetry Collector
+OTEL_VERSION="0.96.0"
+curl -L -o otelcol-contrib.tar.gz \
+  "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol-contrib_${OTEL_VERSION}_linux_amd64.tar.gz"
+tar -xzf otelcol-contrib.tar.gz
+sudo mv otelcol-contrib /usr/local/bin/
+sudo chmod +x /usr/local/bin/otelcol-contrib
+
+# Install Grafana
+GRAFANA_VERSION="10.3.3"
+sudo dnf install -y \
+  "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}-1.x86_64.rpm"
+
+echo "All components installed successfully!"

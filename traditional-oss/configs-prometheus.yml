@@ -1,0 +1,536 @@
+# =============================================================================
+# PROMETHEUS CONFIGURATION
+# File: /etc/prometheus/prometheus.yml
+# =============================================================================
+
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  
+  # External labels identify this Prometheus instance
+  # Used by Thanos for deduplication
+  external_labels:
+    cluster: 'aws-us-east-1'
+    replica: 'prometheus-1'  # Change to prometheus-2 for second instance
+    environment: 'production'
+
+# Alertmanager configuration (if using standalone Alertmanager)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+#             - alertmanager-1.internal:9093
+#             - alertmanager-2.internal:9093
+
+# Rule files for recording rules and alerts
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+# Scrape configurations
+scrape_configs:
+  
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
+        labels:
+          component: 'prometheus'
+  
+  # Thanos Sidecar (on this instance)
+  - job_name: 'thanos-sidecar'
+    static_configs:
+      - targets:
+          - 'localhost:10902'
+        labels:
+          component: 'thanos-sidecar'
+  
+  # Thanos Query instances
+  - job_name: 'thanos-query'
+    static_configs:
+      - targets:
+          - 'thanos-query-1.internal:10902'
+          - 'thanos-query-2.internal:10902'
+        labels:
+          component: 'thanos-query'
+  
+  # Thanos Store Gateway instances
+  - job_name: 'thanos-store'
+    static_configs:
+      - targets:
+          - 'thanos-store-1.internal:10902'
+          - 'thanos-store-2.internal:10902'
+        labels:
+          component: 'thanos-store'
+  
+  # Thanos Compactor
+  - job_name: 'thanos-compactor'
+    static_configs:
+      - targets:
+          - 'thanos-compactor.internal:10902'
+        labels:
+          component: 'thanos-compactor'
+  
+  # Loki instances
+  - job_name: 'loki'
+    static_configs:
+      - targets:
+          - 'loki-1.internal:3100'
+          - 'loki-2.internal:3100'
+        labels:
+          component: 'loki'
+  
+  # Tempo instances
+  - job_name: 'tempo'
+    static_configs:
+      - targets:
+          - 'tempo-1.internal:3200'
+          - 'tempo-2.internal:3200'
+        labels:
+          component: 'tempo'
+  
+  # Grafana instances
+  - job_name: 'grafana'
+    static_configs:
+      - targets:
+          - 'grafana-1.internal:3000'
+          - 'grafana-2.internal:3000'
+        labels:
+          component: 'grafana'
+  
+  # Node exporters on all monitored hosts
+  # This example uses EC2 service discovery
+  - job_name: 'node-exporter'
+    ec2_sd_configs:
+      - region: us-east-1
+        port: 9100
+        filters:
+          - name: tag:Monitoring
+            values:
+              - 'enabled'
+          - name: instance-state-name
+            values:
+              - running
+    
+    relabel_configs:
+      # Use instance ID as the instance label
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+      
+      # Add instance type
+      - source_labels: [__meta_ec2_instance_type]
+        target_label: instance_type
+      
+      # Add availability zone
+      - source_labels: [__meta_ec2_availability_zone]
+        target_label: availability_zone
+      
+      # Use private IP for scraping
+      - source_labels: [__meta_ec2_private_ip]
+        target_label: __address__
+        replacement: '${1}:9100'
+      
+      # Add custom tags as labels
+      - source_labels: [__meta_ec2_tag_Name]
+        target_label: host_name
+      
+      - source_labels: [__meta_ec2_tag_Environment]
+        target_label: environment
+      
+      - source_labels: [__meta_ec2_tag_Application]
+        target_label: application
+
+    # Drop high-cardinality labels
+    metric_relabel_configs:
+      - source_labels: [cpu]
+        regex: 'cpu[0-9]+'
+        action: drop
+      - source_labels: [__name__]
+        regex: 'node_filesystem_.*'
+        source_labels: [mountpoint]
+        regex: '/var/lib/docker/.*'
+        action: drop
+
+# Alternative: Static configuration for monitored hosts
+# - job_name: 'node-exporter-static'
+#   static_configs:
+#     - targets:
+#         - 'web-01.internal:9100'
+#         - 'web-02.internal:9100'
+#         - 'api-01.internal:9100'
+#         - 'api-02.internal:9100'
+#       labels:
+#         environment: 'production'
+#         tier: 'frontend'
+#     
+#     - targets:
+#         - 'db-01.internal:9100'
+#         - 'db-02.internal:9100'
+#       labels:
+#         environment: 'production'
+#         tier: 'database'
+
+# Remote write configuration (if using Prometheus as a collector)
+# Typically not needed when using Thanos
+# remote_write:
+#   - url: http://remote-prometheus:9090/api/v1/write
+#     queue_config:
+#       capacity: 10000
+#       max_shards: 50
+#       max_samples_per_send: 5000
+
+# Storage configuration
+storage:
+  tsdb:
+    path: /var/lib/prometheus/data
+    retention.time: 15d  # Keep 15 days locally, Thanos handles long-term
+    retention.size: 450GB  # Limit storage usage
+
+# =============================================================================
+# THANOS SIDECAR CONFIGURATION
+# File: /etc/thanos/sidecar.yml
+# Run with: thanos sidecar --config.file=/etc/thanos/sidecar.yml
+# =============================================================================
+
+# Object storage configuration for S3
+type: s3
+config:
+  bucket: "prod-observability-thanos-metrics"
+  endpoint: "s3.us-east-1.amazonaws.com"
+  region: "us-east-1"
+  # Use IAM role, no credentials needed
+  # access_key: ""
+  # secret_key: ""
+
+# Sidecar flags (typically passed as command-line args)
+# --prometheus.url=http://localhost:9090
+# --tsdb.path=/var/lib/prometheus/data
+# --grpc-address=0.0.0.0:10901
+# --http-address=0.0.0.0:10902
+# --objstore.config-file=/etc/thanos/sidecar.yml
+
+# =============================================================================
+# THANOS QUERY CONFIGURATION
+# File: /etc/thanos/query.yml (command-line flags)
+# =============================================================================
+
+# Run with:
+# thanos query \
+#   --http-address=0.0.0.0:10902 \
+#   --grpc-address=0.0.0.0:10901 \
+#   --store=prometheus-1.internal:10901 \
+#   --store=prometheus-2.internal:10901 \
+#   --store=thanos-store-1.internal:10901 \
+#   --store=thanos-store-2.internal:10901 \
+#   --query.replica-label=replica \
+#   --query.timeout=5m \
+#   --query.max-concurrent=20
+
+# =============================================================================
+# THANOS STORE GATEWAY CONFIGURATION
+# File: /etc/thanos/store.yml
+# =============================================================================
+
+type: s3
+config:
+  bucket: "prod-observability-thanos-metrics"
+  endpoint: "s3.us-east-1.amazonaws.com"
+  region: "us-east-1"
+
+# Run with:
+# thanos store \
+#   --data-dir=/var/lib/thanos/store \
+#   --objstore.config-file=/etc/thanos/store.yml \
+#   --http-address=0.0.0.0:10902 \
+#   --grpc-address=0.0.0.0:10901 \
+#   --index-cache-size=2GB \
+#   --chunk-pool-size=2GB
+
+# =============================================================================
+# THANOS COMPACTOR CONFIGURATION
+# File: /etc/thanos/compactor.yml
+# =============================================================================
+
+type: s3
+config:
+  bucket: "prod-observability-thanos-metrics"
+  endpoint: "s3.us-east-1.amazonaws.com"
+  region: "us-east-1"
+
+# Run with:
+# thanos compact \
+#   --data-dir=/var/lib/thanos/compact \
+#   --objstore.config-file=/etc/thanos/compactor.yml \
+#   --http-address=0.0.0.0:10902 \
+#   --retention.resolution-raw=7d \
+#   --retention.resolution-5m=90d \
+#   --retention.resolution-1h=730d \
+#   --wait \
+#   --compact.concurrency=1
+
+# =============================================================================
+# PROMETHEUS RECORDING RULES
+# File: /etc/prometheus/rules/recording_rules.yml
+# =============================================================================
+
+groups:
+  - name: node_exporter_aggregation
+    interval: 30s
+    rules:
+      # CPU usage per instance
+      - record: instance:cpu_utilization:rate5m
+        expr: |
+          (1 - avg by (instance) (
+            rate(node_cpu_seconds_total{mode="idle"}[5m])
+          )) * 100
+      
+      # Memory usage per instance
+      - record: instance:memory_utilization:ratio
+        expr: |
+          (1 - (
+            node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+          )) * 100
+      
+      # Disk usage per instance
+      - record: instance:disk_utilization:ratio
+        expr: |
+          (1 - (
+            node_filesystem_avail_bytes{mountpoint="/"} / 
+            node_filesystem_size_bytes{mountpoint="/"}
+          )) * 100
+      
+      # Network traffic per instance
+      - record: instance:network_receive_bytes:rate5m
+        expr: rate(node_network_receive_bytes_total{device!~"lo|veth.*"}[5m])
+      
+      - record: instance:network_transmit_bytes:rate5m
+        expr: rate(node_network_transmit_bytes_total{device!~"lo|veth.*"}[5m])
+
+  - name: application_slo
+    interval: 30s
+    rules:
+      # Request rate per service
+      - record: service:request_rate:rate5m
+        expr: sum by (service, environment) (rate(http_requests_total[5m]))
+      
+      # Error rate per service
+      - record: service:error_rate:rate5m
+        expr: |
+          sum by (service, environment) (rate(http_requests_total{status=~"5.."}[5m])) /
+          sum by (service, environment) (rate(http_requests_total[5m]))
+      
+      # P95 latency per service
+      - record: service:request_duration:p95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (service, environment, le) (
+              rate(http_request_duration_seconds_bucket[5m])
+            )
+          )
+
+# =============================================================================
+# PROMETHEUS ALERT RULES
+# File: /etc/prometheus/rules/alerts.yml
+# =============================================================================
+
+groups:
+  - name: infrastructure_alerts
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "Instance {{ $labels.instance }} is down"
+          description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 5 minutes."
+      
+      - alert: HighCPUUsage
+        expr: instance:cpu_utilization:rate5m > 85
+        for: 10m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | humanize }}% on {{ $labels.instance }}"
+      
+      - alert: HighMemoryUsage
+        expr: instance:memory_utilization:ratio > 90
+        for: 10m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | humanize }}% on {{ $labels.instance }}"
+      
+      - alert: DiskSpaceLow
+        expr: instance:disk_utilization:ratio > 85
+        for: 5m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Disk usage is {{ $value | humanize }}% on {{ $labels.instance }}"
+      
+      - alert: DiskSpaceCritical
+        expr: instance:disk_utilization:ratio > 95
+        for: 2m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "Critical disk space on {{ $labels.instance }}"
+          description: "Disk usage is {{ $value | humanize }}% on {{ $labels.instance }}. Immediate action required."
+
+  - name: observability_platform_alerts
+    rules:
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: monitoring
+        annotations:
+          summary: "Prometheus instance is down"
+          description: "Prometheus {{ $labels.instance }} has been down for more than 2 minutes."
+      
+      - alert: ThanosCompactorFailed
+        expr: thanos_compact_group_compactions_failures_total > 5
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "Thanos Compactor is failing"
+          description: "Thanos Compactor has {{ $value }} failures."
+      
+      - alert: LokiIngesterUnhealthy
+        expr: up{job="loki"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: monitoring
+        annotations:
+          summary: "Loki ingester is down"
+          description: "Loki instance {{ $labels.instance }} is unhealthy."
+
+  - name: application_slo_alerts
+    rules:
+      - alert: HighErrorRate
+        expr: service:error_rate:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: application
+        annotations:
+          summary: "High error rate for {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.service }} in {{ $labels.environment }}"
+      
+      - alert: CriticalErrorRate
+        expr: service:error_rate:rate5m > 0.10
+        for: 2m
+        labels:
+          severity: critical
+          component: application
+        annotations:
+          summary: "Critical error rate for {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }} for {{ $labels.service }} in {{ $labels.environment }}"
+      
+      - alert: HighLatency
+        expr: service:request_duration:p95 > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: application
+        annotations:
+          summary: "High P95 latency for {{ $labels.service }}"
+          description: "P95 latency is {{ $value }}s for {{ $labels.service }} in {{ $labels.environment }}"
+
+# =============================================================================
+# SYSTEMD SERVICE FILES
+# =============================================================================
+
+# File: /etc/systemd/system/prometheus.service
+[Unit]
+Description=Prometheus
+Documentation=https://prometheus.io/docs/introduction/overview/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/data \
+  --storage.tsdb.retention.time=15d \
+  --storage.tsdb.retention.size=450GB \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.enable-lifecycle \
+  --web.enable-admin-api
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# File: /etc/systemd/system/thanos-sidecar.service
+[Unit]
+Description=Thanos Sidecar
+Documentation=https://thanos.io/
+Wants=network-online.target
+After=network-online.target prometheus.service
+Requires=prometheus.service
+
+[Service]
+Type=simple
+User=thanos
+Group=thanos
+ExecStart=/usr/local/bin/thanos sidecar \
+  --prometheus.url=http://localhost:9090 \
+  --tsdb.path=/var/lib/prometheus/data \
+  --grpc-address=0.0.0.0:10901 \
+  --http-address=0.0.0.0:10902 \
+  --objstore.config-file=/etc/thanos/sidecar.yml
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# File: /etc/systemd/system/thanos-query.service
+[Unit]
+Description=Thanos Query
+Documentation=https://thanos.io/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=thanos
+Group=thanos
+ExecStart=/usr/local/bin/thanos query \
+  --http-address=0.0.0.0:10902 \
+  --grpc-address=0.0.0.0:10901 \
+  --store=prometheus-1.internal:10901 \
+  --store=prometheus-2.internal:10901 \
+  --store=thanos-store-1.internal:10901 \
+  --store=thanos-store-2.internal:10901 \
+  --query.replica-label=replica \
+  --query.timeout=5m \
+  --query.max-concurrent=20
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

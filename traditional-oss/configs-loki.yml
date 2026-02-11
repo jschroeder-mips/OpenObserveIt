@@ -1,0 +1,562 @@
+# =============================================================================
+# LOKI CONFIGURATION
+# File: /etc/loki/loki.yml
+# =============================================================================
+
+auth_enabled: false  # Set to true for multi-tenancy
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9095
+  log_level: info
+
+distributor:
+  ring:
+    kvstore:
+      store: memberlist
+
+ingester:
+  lifecycler:
+    ring:
+      kvstore:
+        store: memberlist
+      replication_factor: 2  # 2 instances for HA
+    
+    # How long to buffer data before flushing to S3
+    chunk_idle_period: 30m
+    chunk_block_size: 262144  # 256KB
+    chunk_target_size: 1536000  # 1.5MB compressed
+    
+    # Retain in memory for queries
+    chunk_retain_period: 1m
+    
+    max_transfer_retries: 0
+  
+  # WAL configuration for crash recovery
+  wal:
+    enabled: true
+    dir: /var/lib/loki/wal
+    replay_memory_ceiling: 4GB
+
+memberlist:
+  node_name: loki-1  # Change to loki-2 for second instance
+  bind_port: 7946
+  join_members:
+    - loki-1.internal:7946
+    - loki-2.internal:7946
+
+schema_config:
+  configs:
+    # Schema v12 (recommended for new deployments)
+    - from: 2024-01-01
+      store: tsdb
+      object_store: s3
+      schema: v12
+      index:
+        prefix: loki_index_
+        period: 24h
+
+storage_config:
+  # S3 configuration
+  aws:
+    s3: s3://us-east-1/prod-observability-loki-logs
+    s3forcepathstyle: false
+    # Use IAM role for credentials
+  
+  tsdb_shipper:
+    active_index_directory: /var/lib/loki/tsdb-index
+    cache_location: /var/lib/loki/tsdb-cache
+    cache_ttl: 24h
+    
+    # Upload index to S3 every 15 minutes
+    index_gateway_client:
+      server_address: ""  # Not using index gateway in simple mode
+
+# Compactor for cleaning up old data
+compactor:
+  working_directory: /var/lib/loki/compactor
+  shared_store: s3
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+
+# Limits per tenant (applies globally when auth_enabled: false)
+limits_config:
+  # Ingestion limits
+  ingestion_rate_mb: 100  # 100MB/s per instance
+  ingestion_burst_size_mb: 200
+  
+  # Maximum number of active streams per tenant
+  max_streams_per_user: 0  # Unlimited (be careful!)
+  max_global_streams_per_user: 10000
+  
+  # Label cardinality
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_names_per_series: 30
+  
+  # Query limits
+  max_query_length: 721h  # 30 days
+  max_query_series: 500
+  max_query_parallelism: 32
+  max_entries_limit_per_query: 10000
+  max_cache_freshness_per_query: 10m
+  
+  # Retention (delete after 90 days)
+  retention_period: 2160h  # 90 days
+  
+  # Reject old samples
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h  # 7 days
+  
+  # Per-stream rate limits
+  per_stream_rate_limit: 10MB
+  per_stream_rate_limit_burst: 20MB
+
+# Query frontend for splitting large queries
+frontend:
+  max_outstanding_per_tenant: 2048
+  compress_responses: true
+  log_queries_longer_than: 10s
+
+query_range:
+  align_queries_with_step: true
+  cache_results: true
+  max_retries: 5
+  
+  # Cache configuration (using in-memory for simplicity)
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 1024
+        ttl: 24h
+
+chunk_store_config:
+  max_look_back_period: 0  # Disabled (use limits_config.retention_period)
+  
+  # Cache configuration
+  chunk_cache_config:
+    embedded_cache:
+      enabled: true
+      max_size_mb: 2048
+      ttl: 24h
+
+ruler:
+  storage:
+    type: s3
+    s3:
+      bucketnames: prod-observability-loki-logs
+      s3: s3://us-east-1
+  
+  rule_path: /var/lib/loki/rules-temp
+  alertmanager_url: http://grafana-1.internal:3000/alertmanager
+  ring:
+    kvstore:
+      store: memberlist
+  enable_api: true
+
+# =============================================================================
+# PROMTAIL CONFIGURATION (Log Shipper)
+# File: /etc/promtail/promtail.yml
+# Deployed on all 50 monitored hosts
+# =============================================================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /var/lib/promtail/positions.yaml
+
+clients:
+  # Send to both Loki instances for redundancy
+  - url: http://loki-1.internal:3100/loki/api/v1/push
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+    
+    # Batch configuration
+    batchsize: 1048576  # 1MB
+    batchwait: 1s
+    
+    timeout: 10s
+  
+  - url: http://loki-2.internal:3100/loki/api/v1/push
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+    batchsize: 1048576
+    batchwait: 1s
+    timeout: 10s
+
+# Scrape configurations
+scrape_configs:
+  
+  # System logs
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: syslog
+          host: "${HOSTNAME}"  # Set via environment variable
+          __path__: /var/log/messages
+    
+    pipeline_stages:
+      # Parse syslog format
+      - regex:
+          expression: '^(?P<timestamp>\w+ \d+ \d+:\d+:\d+) (?P<hostname>\S+) (?P<process>\S+?)\[(?P<pid>\d+)\]: (?P<message>.*)$'
+      
+      # Extract log level
+      - labels:
+          process:
+          pid:
+      
+      # Parse timestamp
+      - timestamp:
+          source: timestamp
+          format: 'Jan 02 15:04:05'
+  
+  # Application logs (JSON format)
+  - job_name: application_json
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: app_logs
+          host: "${HOSTNAME}"
+          environment: "production"
+          __path__: /var/log/app/*.json
+    
+    pipeline_stages:
+      # Parse JSON
+      - json:
+          expressions:
+            timestamp: timestamp
+            level: level
+            message: message
+            service: service
+            trace_id: trace_id
+            span_id: span_id
+            user_id: user_id
+      
+      # Extract structured labels
+      - labels:
+          level:
+          service:
+      
+      # Add trace_id and span_id as structured metadata (Loki 2.9+)
+      - structured_metadata:
+          trace_id:
+          span_id:
+      
+      # Parse timestamp
+      - timestamp:
+          source: timestamp
+          format: RFC3339
+      
+      # Drop debug logs
+      - match:
+          selector: '{level="debug"}'
+          action: drop
+  
+  # Application logs (plain text)
+  - job_name: application_text
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: app_logs
+          host: "${HOSTNAME}"
+          environment: "production"
+          __path__: /var/log/app/*.log
+    
+    pipeline_stages:
+      # Multiline aggregation (for stack traces)
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2}'
+          max_lines: 100
+          max_wait_time: 3s
+      
+      # Parse log line
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<message>.*)$'
+      
+      - labels:
+          level:
+      
+      - timestamp:
+          source: timestamp
+          format: '2006-01-02 15:04:05'
+  
+  # Nginx access logs
+  - job_name: nginx_access
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: nginx_access
+          host: "${HOSTNAME}"
+          __path__: /var/log/nginx/access.log
+    
+    pipeline_stages:
+      # Parse nginx log format
+      - regex:
+          expression: '^(?P<remote_addr>[\w\.]+) - (?P<remote_user>[\w-]+) \[(?P<timestamp>.*?)\] "(?P<method>\w+) (?P<path>.*?) (?P<protocol>.*?)" (?P<status>\d+) (?P<bytes_sent>\d+) "(?P<referer>.*?)" "(?P<user_agent>.*?)".*$'
+      
+      - labels:
+          method:
+          status:
+      
+      - timestamp:
+          source: timestamp
+          format: '02/Jan/2006:15:04:05 -0700'
+  
+  # Docker container logs (if using Docker)
+  - job_name: docker
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: docker
+          host: "${HOSTNAME}"
+          __path__: /var/lib/docker/containers/*/*.log
+    
+    pipeline_stages:
+      # Docker wraps logs in JSON
+      - json:
+          expressions:
+            stream: stream
+            log: log
+            time: time
+      
+      - labels:
+          stream:
+      
+      - timestamp:
+          source: time
+          format: RFC3339Nano
+      
+      # Extract container ID from file path
+      - regex:
+          source: filename
+          expression: '/var/lib/docker/containers/(?P<container_id>[^/]+)/.*\.log'
+      
+      - labels:
+          container_id:
+
+# =============================================================================
+# SYSTEMD SERVICE FILES
+# =============================================================================
+
+# File: /etc/systemd/system/loki.service
+[Unit]
+Description=Loki
+Documentation=https://grafana.com/docs/loki/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=loki
+Group=loki
+ExecStart=/usr/local/bin/loki \
+  -config.file=/etc/loki/loki.yml
+
+Restart=always
+RestartSec=5
+
+# Increase file descriptor limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+
+# File: /etc/systemd/system/promtail.service
+[Unit]
+Description=Promtail
+Documentation=https://grafana.com/docs/loki/latest/clients/promtail/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=promtail
+Group=promtail
+ExecStart=/usr/local/bin/promtail \
+  -config.file=/etc/promtail/promtail.yml
+
+Restart=always
+RestartSec=5
+
+Environment="HOSTNAME=%H"
+
+[Install]
+WantedBy=multi-user.target
+
+# =============================================================================
+# LOGQL QUERY EXAMPLES
+# =============================================================================
+
+# Basic log search by labels
+{job="app_logs", environment="production"}
+
+# Search for specific text in logs
+{job="app_logs"} |= "error"
+
+# Search with regex
+{job="app_logs"} |~ "error|exception|fatal"
+
+# Exclude text
+{job="app_logs"} != "debug"
+
+# JSON field extraction
+{job="app_logs"} | json | level="error"
+
+# Count logs by level
+sum by (level) (count_over_time({job="app_logs"}[5m]))
+
+# Error rate
+sum(rate({job="app_logs", level="error"}[5m])) / 
+sum(rate({job="app_logs"}[5m]))
+
+# P95 latency from nginx logs
+quantile_over_time(0.95,
+  {job="nginx_access"} 
+  | logfmt 
+  | unwrap request_time [5m]
+) by (method)
+
+# Find logs for specific trace ID
+{job="app_logs"} | json | trace_id="abc123def456"
+
+# Top 10 error messages
+topk(10,
+  sum by (message) (
+    count_over_time({level="error"}[1h])
+  )
+)
+
+# Logs with high cardinality user_id
+{job="app_logs"} | json | user_id != ""
+
+# Multiline log aggregation
+{job="app_logs"} |= "Exception" | pattern `<_> <exception_type>: <message>`
+
+# =============================================================================
+# LOKI ALERTS (Ruler Configuration)
+# File: /var/lib/loki/rules/alerts.yml
+# =============================================================================
+
+groups:
+  - name: log_alerts
+    interval: 1m
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate({level="error"}[5m])) by (service) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: application
+        annotations:
+          summary: "High error rate in {{ $labels.service }}"
+          description: "Service {{ $labels.service }} has {{ $value }} errors/sec"
+      
+      - alert: CriticalErrors
+        expr: |
+          count_over_time({level="critical"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: application
+        annotations:
+          summary: "Critical errors detected"
+          description: "{{ $value }} critical errors in the last 5 minutes"
+      
+      - alert: NoLogsReceived
+        expr: |
+          sum(rate({job="app_logs"}[5m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "No logs received from application"
+          description: "Application logs have not been received for 10 minutes"
+      
+      - alert: HighIngestionRate
+        expr: |
+          sum(rate(loki_distributor_bytes_received_total[5m])) > 100000000
+        for: 10m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "Loki ingestion rate is very high"
+          description: "Loki is ingesting {{ $value | humanize }}B/s"
+
+# =============================================================================
+# INSTALLATION SCRIPT (Example for Amazon Linux 2023)
+# File: install-loki.sh
+# =============================================================================
+
+#!/bin/bash
+set -e
+
+LOKI_VERSION="2.9.4"
+PROMTAIL_VERSION="2.9.4"
+
+# Create users
+sudo useradd --no-create-home --shell /bin/false loki
+sudo useradd --no-create-home --shell /bin/false promtail
+
+# Create directories
+sudo mkdir -p /var/lib/loki/{wal,tsdb-index,tsdb-cache,compactor,rules-temp}
+sudo mkdir -p /var/lib/promtail
+sudo mkdir -p /etc/loki
+sudo mkdir -p /etc/promtail
+
+# Download Loki
+curl -L -o loki.zip \
+  "https://github.com/grafana/loki/releases/download/v${LOKI_VERSION}/loki-linux-amd64.zip"
+unzip loki.zip
+sudo mv loki-linux-amd64 /usr/local/bin/loki
+sudo chmod +x /usr/local/bin/loki
+
+# Download Promtail
+curl -L -o promtail.zip \
+  "https://github.com/grafana/loki/releases/download/v${PROMTAIL_VERSION}/promtail-linux-amd64.zip"
+unzip promtail.zip
+sudo mv promtail-linux-amd64 /usr/local/bin/promtail
+sudo chmod +x /usr/local/bin/promtail
+
+# Set permissions
+sudo chown -R loki:loki /var/lib/loki /etc/loki
+sudo chown -R promtail:promtail /var/lib/promtail /etc/promtail
+
+# Copy configuration (you need to create these first)
+sudo cp loki.yml /etc/loki/loki.yml
+sudo cp promtail.yml /etc/promtail/promtail.yml
+
+# Copy systemd service files
+sudo cp loki.service /etc/systemd/system/loki.service
+sudo cp promtail.service /etc/systemd/system/promtail.service
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Enable and start services
+sudo systemctl enable loki promtail
+sudo systemctl start loki promtail
+
+# Check status
+sudo systemctl status loki
+sudo systemctl status promtail
+
+echo "Loki and Promtail installed successfully!"

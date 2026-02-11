@@ -1,0 +1,311 @@
+OBSERVABILITY PLATFORM - AWS INFRASTRUCTURE DIAGRAM
+=====================================================
+
+┌─────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    INTERNET                                                  │
+│                                       │                                                      │
+│                                       │ HTTPS                                                │
+│                                       ▼                                                      │
+│                            ┌──────────────────────┐                                         │
+│                            │  Route 53 (DNS)      │                                         │
+│                            │  grafana.example.com │                                         │
+│                            └──────────┬───────────┘                                         │
+└────────────────────────────────────────┼──────────────────────────────────────────────────┘
+                                         │
+                                         │
+┌────────────────────────────────────────┼──────────────────────────────────────────────────┐
+│                              AWS VPC (10.0.0.0/16)                                          │
+│                                        │                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                          PUBLIC SUBNETS                                              │  │
+│  │  ┌─────────────────┐                          ┌─────────────────┐                   │  │
+│  │  │ AZ us-east-1a   │                          │ AZ us-east-1b   │                   │  │
+│  │  │ 10.0.1.0/24     │                          │ 10.0.2.0/24     │                   │  │
+│  │  │                 │                          │                 │                   │  │
+│  │  │  ┌─────────────────────────────────────────────────────┐   │                   │  │
+│  │  │  │    Application Load Balancer (ALB)                  │   │                   │  │
+│  │  │  │    grafana-public-alb                               │   │                   │  │
+│  │  │  │    - Port 443 (HTTPS)                               │   │                   │  │
+│  │  │  │    - ACM Certificate                                │   │                   │  │
+│  │  │  │    - WAF Enabled (optional)                         │   │                   │  │
+│  │  │  └─────────────────────────┬───────────────────────────┘   │                   │  │
+│  │  └─────────────────────────────┼─────────────────────────────────┘               │  │
+│  └────────────────────────────────┼─────────────────────────────────────────────────┘  │
+│                                    │                                                     │
+│                                    │ Forward to Private Subnets                          │
+│                                    ▼                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                    OBSERVABILITY PRIVATE SUBNETS                                     │  │
+│  │  ┌──────────────────────────────┐      ┌──────────────────────────────┐            │  │
+│  │  │  AZ us-east-1a               │      │  AZ us-east-1b               │            │  │
+│  │  │  10.0.10.0/24                │      │  10.0.11.0/24                │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Grafana-1           │    │      │  │ Grafana-2           │    │            │  │
+│  │  │  │ t3.medium           │    │      │  │ t3.medium           │    │            │  │
+│  │  │  │ Port 3000           │◄───┼──────┼─►│ Port 3000           │    │            │  │
+│  │  │  └─────────────────────┘    │      │  └─────────────────────┘    │            │  │
+│  │  │           │                  │      │           │                  │            │  │
+│  │  │           └──────────────────┼──────┼───────────┘                  │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │                              │      │      │ Query                 │            │  │
+│  │  │                              │      │      ▼                       │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Prometheus-1        │    │      │  │ Prometheus-2        │    │            │  │
+│  │  │  │ t3.large            │    │      │  │ t3.large            │    │            │  │
+│  │  │  │ + Thanos Sidecar    │    │      │  │ + Thanos Sidecar    │    │            │  │
+│  │  │  │ Port 9090 (HTTP)    │    │      │  │ Port 9090 (HTTP)    │    │            │  │
+│  │  │  │ Port 10901 (gRPC)   │    │      │  │ Port 10901 (gRPC)   │    │            │  │
+│  │  │  └─────────┬───────────┘    │      │  └─────────┬───────────┘    │            │  │
+│  │  │            │ Upload blocks   │      │            │ Upload blocks   │            │  │
+│  │  │            └─────────────────┼──────┼────────────┘                 │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │                              │      │      ▼                       │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Thanos Query-1      │    │      │  │ Thanos Query-2      │    │            │  │
+│  │  │  │ t3.medium           │◄───┼──────┼─►│ t3.medium           │    │            │  │
+│  │  │  │ Port 10902          │    │      │  │ Port 10902          │    │            │  │
+│  │  │  └─────────┬───────────┘    │      │  └─────────┬───────────┘    │            │  │
+│  │  │            │                 │      │            │                 │            │  │
+│  │  │            └─────────────────┼──────┼────────────┘                 │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │                              │      │      │ Query Store           │            │  │
+│  │  │                              │      │      ▼                       │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Thanos Store GW-1   │    │      │  │ Thanos Store GW-2   │    │            │  │
+│  │  │  │ t3.medium           │◄───┼──────┼─►│ t3.medium           │    │            │  │
+│  │  │  │ (Reads from S3)     │    │      │  │ (Reads from S3)     │    │            │  │
+│  │  │  └─────────────────────┘    │      │  └─────────────────────┘    │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │                              │            │  │
+│  │  │  │ Thanos Compactor    │    │      │                              │            │  │
+│  │  │  │ t3.medium           │    │      │                              │            │  │
+│  │  │  │ (Downsampling)      │    │      │                              │            │  │
+│  │  │  └─────────────────────┘    │      │                              │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Loki-1              │    │      │  │ Loki-2              │    │            │  │
+│  │  │  │ t3.xlarge           │◄───┼──────┼─►│ t3.xlarge           │    │            │  │
+│  │  │  │ Port 3100           │    │      │  │ Port 3100           │    │            │  │
+│  │  │  │ (Read + Write)      │    │      │  │ (Read + Write)      │    │            │  │
+│  │  │  └─────────┬───────────┘    │      │  └─────────┬───────────┘    │            │  │
+│  │  │            │ Upload chunks   │      │            │ Upload chunks   │            │  │
+│  │  │            └─────────────────┼──────┼────────────┘                 │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Tempo-1             │    │      │  │ Tempo-2             │    │            │  │
+│  │  │  │ t3.large            │◄───┼──────┼─►│ t3.large            │    │            │  │
+│  │  │  │ Port 3200 (HTTP)    │    │      │  │ Port 3200 (HTTP)    │    │            │  │
+│  │  │  │ Port 4317 (gRPC)    │    │      │  │ Port 4317 (gRPC)    │    │            │  │
+│  │  │  └─────────┬───────────┘    │      │  └─────────┬───────────┘    │            │  │
+│  │  │            │ Upload traces   │      │            │ Upload traces   │            │  │
+│  │  │            └─────────────────┼──────┼────────────┘                 │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │                              │            │  │
+│  │  │  │ Faro Collector      │    │      │                              │            │  │
+│  │  │  │ t3.small            │    │      │                              │            │  │
+│  │  │  │ Port 12347          │    │      │                              │            │  │
+│  │  │  └─────────────────────┘    │      │                              │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │                              │            │  │
+│  │  │  │ RDS PostgreSQL      │    │      │                              │            │  │
+│  │  │  │ db.t3.small         │◄───┼──────┼─► Multi-AZ Standby          │            │  │
+│  │  │  │ (Grafana Backend)   │    │      │                              │            │  │
+│  │  │  └─────────────────────┘    │      │                              │            │  │
+│  │  └──────────────────────────────┘      └──────────────────────────────┘            │  │
+│  └─────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                             │
+│                                         │                                                   │
+│                                         │ S3 VPC Endpoint (Gateway)                        │
+│                                         ▼                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │                           MONITORING SUBNETS                                         │  │
+│  │  ┌──────────────────────────────┐      ┌──────────────────────────────┐            │  │
+│  │  │  AZ us-east-1a               │      │  AZ us-east-1b               │            │  │
+│  │  │  10.0.20.0/24                │      │  10.0.21.0/24                │            │  │
+│  │  │                              │      │                              │            │  │
+│  │  │  ┌─────────────────────┐    │      │  ┌─────────────────────┐    │            │  │
+│  │  │  │ Monitored Host 1-25 │    │      │  │ Monitored Host 26-50│    │            │  │
+│  │  │  │                     │    │      │  │                     │    │            │  │
+│  │  │  │ Running:            │    │      │  │ Running:            │    │            │  │
+│  │  │  │ - Applications      │    │      │  │ - Applications      │    │            │  │
+│  │  │  │ - OTel Collector   │─────┼──────┼──│ - OTel Collector   │    │            │  │
+│  │  │  │ - node_exporter    │     │      │  │ - node_exporter    │    │            │  │
+│  │  │  │ - Promtail         │     │      │  │ - Promtail         │    │            │  │
+│  │  │  └─────────┬───────────┘    │      │  └─────────┬───────────┘    │            │  │
+│  │  │            │                 │      │            │                 │            │  │
+│  │  │            │ Push metrics    │      │            │ Push metrics    │            │  │
+│  │  │            │ Push logs       │      │            │ Push logs       │            │  │
+│  │  │            │ Push traces     │      │            │ Push traces     │            │  │
+│  │  │            │                 │      │            │                 │            │  │
+│  │  │            └─────────────────┼──────┼────────────┘                 │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │                              │      │      │                       │            │  │
+│  │  │                              │      │      ▲                       │            │  │
+│  │  └──────────────────────────────┘      └──────┼───────────────────────┘            │  │
+│  └─────────────────────────────────────────────────┼──────────────────────────────────┘  │
+│                                                     │                                      │
+└─────────────────────────────────────────────────────┼──────────────────────────────────────┘
+                                                      │
+                                                      │
+┌─────────────────────────────────────────────────────┼──────────────────────────────────────┐
+│                               AWS S3 (Object Storage)                                      │
+│                                                     │                                      │
+│  ┌────────────────────────────┐  ┌────────────────────────────┐  ┌─────────────────────┐ │
+│  │ thanos-metrics-bucket      │  │ loki-logs-bucket           │  │ tempo-traces-bucket │ │
+│  │                            │  │                            │  │                     │ │
+│  │ - 2TB/year                 │  │ - 1.5TB/month              │  │ - 600GB/month       │ │
+│  │ - S3 Standard → Intelligent│  │ - S3 Standard → Glacier    │  │ - S3 Standard       │ │
+│  │ - Lifecycle: 30d downsample│  │ - Lifecycle: 90d retention │  │ - Lifecycle: 30d    │ │
+│  │ - Versioning: Disabled     │  │ - Versioning: Disabled     │  │ - Versioning: Off   │ │
+│  │ - Encryption: SSE-S3       │  │ - Encryption: SSE-S3       │  │ - Encryption: SSE-S3│ │
+│  │                            │  │                            │  │                     │ │
+│  │ Cost: ~$50-70/month        │  │ Cost: ~$35-45/month        │  │ Cost: ~$15/month    │ │
+│  └────────────────────────────┘  └────────────────────────────┘  └─────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+DATA FLOW LEGEND:
+=================
+
+Metrics Flow:  Monitored Hosts → OTel Collector → Prometheus → Thanos Sidecar → S3
+                                                  ↓
+                                          Thanos Query ← Grafana
+
+Logs Flow:     Monitored Hosts → Promtail → Loki → S3
+                                            ↓
+                                          Loki Querier ← Grafana
+
+Traces Flow:   Monitored Hosts → OTel Collector → Tempo → S3
+                                                  ↓
+                                          Tempo Querier ← Grafana
+
+RUM Flow:      Browser → Faro Collector → Loki + Tempo + Prometheus
+                                          ↓
+                                        Grafana
+
+
+NETWORK SECURITY:
+=================
+
+Internet → ALB (Port 443)
+  └─> Grafana (Port 3000) [Private Subnet]
+      └─> Prometheus (Port 9090) [Private Subnet]
+      └─> Loki (Port 3100) [Private Subnet]
+      └─> Tempo (Port 3200) [Private Subnet]
+
+Monitored Hosts [Private Subnet]
+  └─> Prometheus (Port 9090) [Remote Write]
+  └─> Loki (Port 3100) [HTTP Push]
+  └─> Tempo (Port 4317) [OTLP gRPC]
+
+All components → S3 via VPC Endpoint (No NAT Gateway needed)
+
+
+HIGH AVAILABILITY:
+==================
+
+Component           Primary (us-east-1a)    Secondary (us-east-1b)
+---------           --------------------    ----------------------
+Grafana             grafana-1               grafana-2
+Prometheus          prometheus-1            prometheus-2
+Thanos Query        thanos-query-1          thanos-query-2
+Thanos Store GW     store-gw-1              store-gw-2
+Loki                loki-1                  loki-2
+Tempo               tempo-1                 tempo-2
+RDS PostgreSQL      Primary                 Multi-AZ Standby
+
+Load Balancing:
+  - Grafana: ALB with round-robin + sticky sessions
+  - Prometheus: Internal NLB (for Thanos Query)
+  - Loki: Internal ALB (duplicate writes to both instances)
+  - Tempo: Internal ALB (consistent hash ring)
+
+
+MONITORING HOSTS CONFIGURATION:
+================================
+
+Each of 50 monitored hosts runs:
+
+┌────────────────────────────────────────┐
+│        Application Host                │
+│                                        │
+│  ┌──────────────────────────────────┐ │
+│  │   Your Application(s)            │ │
+│  │   - Instrumented with OTel SDK   │ │
+│  │   - Exports metrics/traces       │ │
+│  └────────────┬─────────────────────┘ │
+│               │                        │
+│               ▼                        │
+│  ┌──────────────────────────────────┐ │
+│  │   OpenTelemetry Collector        │ │
+│  │   (Agent Mode)                   │ │
+│  │   - Receives: OTLP               │ │
+│  │   - Processes: batch, filter     │ │
+│  │   - Exports:                     │ │
+│  │     • Prometheus (remote_write)  │ │
+│  │     • Loki (push)                │ │
+│  │     • Tempo (OTLP)               │ │
+│  └──────────────────────────────────┘ │
+│                                        │
+│  ┌──────────────────────────────────┐ │
+│  │   node_exporter                  │ │
+│  │   Port 9100                      │ │
+│  │   - CPU, memory, disk metrics    │ │
+│  └──────────────────────────────────┘ │
+│                                        │
+│  ┌──────────────────────────────────┐ │
+│  │   Promtail                       │ │
+│  │   - Tails /var/log/*             │ │
+│  │   - Pushes to Loki               │ │
+│  └──────────────────────────────────┘ │
+│                                        │
+└────────────────────────────────────────┘
+
+Memory footprint per host:
+  - OTel Collector: ~100MB
+  - node_exporter: ~20MB
+  - Promtail: ~50MB
+  - Total: ~170MB (negligible overhead)
+
+
+COST BREAKDOWN BY COMPONENT:
+=============================
+
+Compute (EC2):
+  - 2x t3.large (Prometheus):     $120/month
+  - 2x t3.medium (Thanos Query):  $60/month
+  - 2x t3.medium (Store GW):      $60/month
+  - 1x t3.medium (Compactor):     $30/month
+  - 2x t3.xlarge (Loki):          $280/month
+  - 2x t3.large (Tempo):          $120/month
+  - 2x t3.medium (Grafana):       $60/month
+  - 1x t3.small (Faro):           $15/month
+  Total Compute: $745/month
+
+Storage (EBS):
+  - Prometheus (2x 500GB gp3):    $80/month
+  - Loki (2x 200GB gp3):          $40/month
+  - Tempo (2x 100GB gp3):         $20/month
+  - Others (400GB total):         $40/month
+  Total EBS: $180/month
+
+Storage (S3):
+  - Metrics (Thanos):             $60/month
+  - Logs (Loki):                  $40/month
+  - Traces (Tempo):               $15/month
+  Total S3: $115/month
+
+Database (RDS):
+  - PostgreSQL db.t3.small:       $50/month
+
+Networking:
+  - 1x Public ALB:                $25/month
+  - 1x Internal ALB:              $20/month
+  - Data transfer:                $10/month
+  Total Networking: $55/month
+
+GRAND TOTAL: ~$1,145/month
+
+Optimized (Spot + Graviton + Reserved):
+  Total: ~$750-850/month
